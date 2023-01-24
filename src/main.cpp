@@ -3,21 +3,31 @@
 #include <unistd.h>
 #include <signal.h>
 
-#include "interfaces.h"
-#include "version.h"
-#include "misc.h"
-#include "socket.h"
-#include "webget.h"
-#include "logger.h"
+#include <sys/types.h>
+#include <dirent.h>
 
-extern std::string pref_path, access_token, listen_address, gen_profile;
-extern bool api_mode, generator_mode, cfw_child_process, update_ruleset_on_request;
-extern int listen_port, max_concurrent_threads, max_pending_connections;
-extern string_array rulesets;
-extern std::vector<ruleset_content> ruleset_content_array;
+#include "config/ruleset.h"
+#include "handler/interfaces.h"
+#include "handler/webget.h"
+#include "handler/settings.h"
+#include "script/cron.h"
+#include "server/socket.h"
+#include "server/webserver.h"
+#include "utils/defer.h"
+#include "utils/file_extra.h"
+#include "utils/logger.h"
+#include "utils/network.h"
+#include "utils/rapidjson_extra.h"
+#include "utils/system.h"
+#include "utils/urlencode.h"
+#include "version.h"
+
+//#include "vfs.h"
+
+WebServer webServer;
 
 #ifndef _WIN32
-void SetConsoleTitle(std::string title)
+void SetConsoleTitle(const std::string &title)
 {
     system(std::string("echo \"\\033]0;" + title + "\\007\\c\"").data());
 }
@@ -54,15 +64,29 @@ void chkArg(int argc, char *argv[])
     {
         if(strcmp(argv[i], "-cfw") == 0)
         {
-            cfw_child_process = true;
-            update_ruleset_on_request = true;
+            global.CFWChildProcess = true;
+            global.updateRulesetOnRequest = true;
         }
         else if(strcmp(argv[i], "-f") == 0 || strcmp(argv[i], "--file") == 0)
-            pref_path.assign(argv[++i]);
+        {
+            if(i < argc - 1)
+                global.prefPath.assign(argv[++i]);
+        }
         else if(strcmp(argv[i], "-g") == 0 || strcmp(argv[i], "--gen") == 0)
-            generator_mode = true;
+        {
+            global.generatorMode = true;
+        }
         else if(strcmp(argv[i], "--artifact") == 0)
-            gen_profile.assign(argv[++i]);
+        {
+            if(i < argc - 1)
+                global.generateProfiles.assign(argv[++i]);
+        }
+        else if(strcmp(argv[i], "-l") == 0 || strcmp(argv[i], "--log") == 0)
+        {
+            if(i < argc - 1)
+                if(freopen(argv[++i], "a", stderr) == NULL)
+                    std::cerr<<"Error redirecting output to file.\n";
+        }
     }
 }
 
@@ -78,13 +102,44 @@ void signal_handler(int sig)
 #endif // _WIN32
     case SIGTERM:
     case SIGINT:
-        stop_web_server();
+        webServer.stop_web_server();
         break;
     }
 }
 
+void cron_tick_caller()
+{
+    if(global.enableCron)
+        cron_tick();
+}
+
 int main(int argc, char *argv[])
 {
+#ifndef _DEBUG
+    std::string prgpath = argv[0];
+    setcd(prgpath); //first switch to program directory
+#endif // _DEBUG
+    if(fileExist("pref.toml"))
+        global.prefPath = "pref.toml";
+    else if(fileExist("pref.yml"))
+        global.prefPath = "pref.yml";
+    else if(!fileExist("pref.ini"))
+    {
+        if(fileExist("pref.example.toml"))
+        {
+            fileCopy("pref.example.toml", "pref.toml");
+            global.prefPath = "pref.toml";
+        }
+        else if(fileExist("pref.example.yml"))
+        {
+            fileCopy("pref.example.yml", "pref.yml");
+            global.prefPath = "pref.yml";
+        }
+        else if(fileExist("pref.example.ini"))
+            fileCopy("pref.example.ini", "pref.ini");
+    }
+    chkArg(argc, argv);
+    setcd(global.prefPath); //then switch to pref directory
     writeLog(0, "SubConverter " VERSION " starting up..", LOG_LEVEL_INFO);
 #ifdef _WIN32
     WSADATA wsaData;
@@ -95,6 +150,7 @@ int main(int argc, char *argv[])
         return 1;
     }
     UINT origcp = GetConsoleOutputCP();
+    defer(SetConsoleOutputCP(origcp);)
     SetConsoleOutputCP(65001);
 #else
     signal(SIGPIPE, SIG_IGN);
@@ -106,204 +162,145 @@ int main(int argc, char *argv[])
     signal(SIGINT, signal_handler);
 
     SetConsoleTitle("SubConverter " VERSION);
-#ifndef _DEBUG
-    std::string prgpath = argv[0];
-    setcd(prgpath); //first switch to program directory
-#endif // _DEBUG
-    if(fileExist("pref.yml"))
-        pref_path = "pref.yml";
-    chkArg(argc, argv);
-    setcd(pref_path); //then switch to pref directory
     readConf();
-    if(!update_ruleset_on_request)
-        refreshRulesets(rulesets, ruleset_content_array);
-    generateBase();
+    //vfs::vfs_read("vfs.ini");
+    if(!global.updateRulesetOnRequest)
+        refreshRulesets(global.customRulesets, global.rulesetsContent);
 
-    if(generator_mode)
+    std::string env_api_mode = getEnv("API_MODE"), env_managed_prefix = getEnv("MANAGED_PREFIX"), env_token = getEnv("API_TOKEN");
+    global.APIMode = tribool().parse(toLower(env_api_mode)).get(global.APIMode);
+    if(env_managed_prefix.size())
+        global.managedConfigPrefix = env_managed_prefix;
+    if(env_token.size())
+        global.accessToken = env_token;
+
+    if(global.generatorMode)
+        return simpleGenerator();
+
+    /*
+    webServer.append_response("GET", "/", "text/plain", [](RESPONSE_CALLBACK_ARGS) -> std::string
     {
-        int retVal = simpleGenerator();
-#ifdef _WIN32
-        SetConsoleOutputCP(origcp);
-#endif // _WIN32
-        return retVal;
-    }
+        return "subconverter " VERSION " backend\n";
+    });
+    */
 
-    append_response("GET", "/", "text/plain", [](RESPONSE_CALLBACK_ARGS) -> std::string
+    webServer.append_response("GET", "/version", "text/plain", [](RESPONSE_CALLBACK_ARGS) -> std::string
     {
         return "subconverter " VERSION " backend\n";
     });
 
-    append_response("GET", "/version", "text/plain", [](RESPONSE_CALLBACK_ARGS) -> std::string
+    webServer.append_response("GET", "/refreshrules", "text/plain", [](RESPONSE_CALLBACK_ARGS) -> std::string
     {
-        return "subconverter " VERSION " backend\n";
-    });
-
-    append_response("GET", "/refreshrules", "text/plain", [](RESPONSE_CALLBACK_ARGS) -> std::string
-    {
-        if(access_token.size())
+        if(global.accessToken.size())
         {
-            std::string token = getUrlArg(argument, "token");
-            if(token != access_token)
+            std::string token = getUrlArg(request.argument, "token");
+            if(token != global.accessToken)
             {
-                *status_code = 403;
+                response.status_code = 403;
                 return "Forbidden\n";
             }
         }
-        refreshRulesets(rulesets, ruleset_content_array);
-        generateBase();
+        refreshRulesets(global.customRulesets, global.rulesetsContent);
         return "done\n";
     });
 
-    append_response("GET", "/readconf", "text/plain", [](RESPONSE_CALLBACK_ARGS) -> std::string
+    webServer.append_response("GET", "/readconf", "text/plain", [](RESPONSE_CALLBACK_ARGS) -> std::string
     {
-        if(access_token.size())
+        if(global.accessToken.size())
         {
-            std::string token = getUrlArg(argument, "token");
-            if(token != access_token)
+            std::string token = getUrlArg(request.argument, "token");
+            if(token != global.accessToken)
             {
-                *status_code = 403;
+                response.status_code = 403;
                 return "Forbidden\n";
             }
         }
         readConf();
-        generateBase();
+        if(!global.updateRulesetOnRequest)
+            refreshRulesets(global.customRulesets, global.rulesetsContent);
         return "done\n";
     });
 
-    append_response("POST", "/updateconf", "text/plain", [](RESPONSE_CALLBACK_ARGS) -> std::string
+    webServer.append_response("POST", "/updateconf", "text/plain", [](RESPONSE_CALLBACK_ARGS) -> std::string
     {
-        if(access_token.size())
+        if(global.accessToken.size())
         {
-            std::string token = getUrlArg(argument, "token");
-            if(token != access_token)
+            std::string token = getUrlArg(request.argument, "token");
+            if(token != global.accessToken)
             {
-                *status_code = 403;
+                response.status_code = 403;
                 return "Forbidden\n";
             }
         }
-        std::string type = getUrlArg(argument, "type");
+        std::string type = getUrlArg(request.argument, "type");
         if(type == "form")
-            fileWrite(pref_path, getFormData(postdata), true);
+            fileWrite(global.prefPath, getFormData(request.postdata), true);
         else if(type == "direct")
-            fileWrite(pref_path, postdata, true);
+            fileWrite(global.prefPath, request.postdata, true);
         else
         {
-            *status_code = 501;
+            response.status_code = 501;
             return "Not Implemented\n";
         }
 
         readConf();
-        if(!update_ruleset_on_request)
-            refreshRulesets(rulesets, ruleset_content_array);
-        generateBase();
+        if(!global.updateRulesetOnRequest)
+            refreshRulesets(global.customRulesets, global.rulesetsContent);
         return "done\n";
     });
 
-    append_response("GET", "/sub", "text/plain;charset=utf-8", subconverter);
-
-    append_response("GET", "/sub2clashr", "text/plain;charset=utf-8", simpleToClashR);
-
-    append_response("GET", "/surge2clash", "text/plain;charset=utf-8", surgeConfToClash);
-
-    append_response("GET", "/getruleset", "text/plain;charset=utf-8", getRuleset);
-
-    append_response("GET", "/getprofile", "text/plain;charset=utf-8", getProfile);
-
-    append_response("GET", "/qx-script", "text/plain;charset=utf-8", getScript);
-
-    append_response("GET", "/qx-rewrite", "text/plain;charset=utf-8", getRewriteRemote);
-
-    append_response("GET", "/clash", "text/plain;charset=utf-8", [](RESPONSE_CALLBACK_ARGS) -> std::string
+    webServer.append_response("GET", "/flushcache", "text/plain", [](RESPONSE_CALLBACK_ARGS) -> std::string
     {
-        return subconverter(argument + "&target=clash", postdata, status_code, extra_headers);
-    });
-
-    append_response("GET", "/clashr", "text/plain;charset=utf-8", [](RESPONSE_CALLBACK_ARGS) -> std::string
-    {
-        return subconverter(argument + "&target=clashr", postdata, status_code, extra_headers);
-    });
-
-    append_response("GET", "/surge", "text/plain;charset=utf-8", [](RESPONSE_CALLBACK_ARGS) -> std::string
-    {
-        return subconverter(argument + "&target=surge", postdata, status_code, extra_headers);
-    });
-
-    append_response("GET", "/surfboard", "text/plain;charset=utf-8", [](RESPONSE_CALLBACK_ARGS) -> std::string
-    {
-        return subconverter(argument + "&target=surfboard", postdata, status_code, extra_headers);
-    });
-
-    append_response("GET", "/mellow", "text/plain;charset=utf-8", [](RESPONSE_CALLBACK_ARGS) -> std::string
-    {
-        return subconverter(argument + "&target=mellow", postdata, status_code, extra_headers);
-    });
-
-    append_response("GET", "/ss", "text/plain", [](RESPONSE_CALLBACK_ARGS) -> std::string
-    {
-        return subconverter(argument + "&target=ss", postdata, status_code, extra_headers);
-    });
-
-    append_response("GET", "/sssub", "text/plain", [](RESPONSE_CALLBACK_ARGS) -> std::string
-    {
-        return subconverter(argument + "&target=sssub", postdata, status_code, extra_headers);
-    });
-
-    append_response("GET", "/ssr", "text/plain", [](RESPONSE_CALLBACK_ARGS) -> std::string
-    {
-        return subconverter(argument + "&target=ssr", postdata, status_code, extra_headers);
-    });
-
-    append_response("GET", "/v2ray", "text/plain", [](RESPONSE_CALLBACK_ARGS) -> std::string
-    {
-        return subconverter(argument + "&target=v2ray", postdata, status_code, extra_headers);
-    });
-
-    append_response("GET", "/quan", "text/plain", [](RESPONSE_CALLBACK_ARGS) -> std::string
-    {
-        return subconverter(argument + "&target=quan", postdata, status_code, extra_headers);
-    });
-
-    append_response("GET", "/quanx", "text/plain;charset=utf-8", [](RESPONSE_CALLBACK_ARGS) -> std::string
-    {
-        return subconverter(argument + "&target=quanx", postdata, status_code, extra_headers);
-    });
-
-    append_response("GET", "/loon", "text/plain;charset=utf-8", [](RESPONSE_CALLBACK_ARGS) -> std::string
-    {
-        return subconverter(argument + "&target=loon", postdata, status_code, extra_headers);
-    });
-
-    append_response("GET", "/ssd", "text/plain", [](RESPONSE_CALLBACK_ARGS) -> std::string
-    {
-        return subconverter(argument + "&target=ssd", postdata, status_code, extra_headers);
-    });
-
-    append_response("GET", "/trojan", "text/plain", [](RESPONSE_CALLBACK_ARGS) -> std::string
-    {
-        return subconverter(argument + "&target=trojan", postdata, status_code, extra_headers);
-    });
-
-    if(!api_mode)
-    {
-        append_response("GET", "/get", "text/plain;charset=utf-8", [](RESPONSE_CALLBACK_ARGS) -> std::string
+        if(getUrlArg(request.argument, "token") != global.accessToken)
         {
-            std::string url = UrlDecode(getUrlArg(argument, "url"));
+            response.status_code = 403;
+            return "Forbidden";
+        }
+        flushCache();
+        return "done";
+    });
+
+    webServer.append_response("GET", "/sub", "text/plain;charset=utf-8", subconverter);
+
+    webServer.append_response("HEAD", "/sub", "text/plain", subconverter);
+
+    webServer.append_response("GET", "/sub2clashr", "text/plain;charset=utf-8", simpleToClashR);
+
+    webServer.append_response("GET", "/surge2clash", "text/plain;charset=utf-8", surgeConfToClash);
+
+    webServer.append_response("GET", "/getruleset", "text/plain;charset=utf-8", getRuleset);
+
+    webServer.append_response("GET", "/getprofile", "text/plain;charset=utf-8", getProfile);
+
+    webServer.append_response("GET", "/render", "text/plain;charset=utf-8", renderTemplate);
+
+    webServer.append_response("GET", "/convert", "text/plain;charset=utf-8", getConvertedRuleset);
+
+    if(!global.APIMode)
+    {
+        webServer.append_response("GET", "/get", "text/plain;charset=utf-8", [](RESPONSE_CALLBACK_ARGS) -> std::string
+        {
+            std::string url = urlDecode(getUrlArg(request.argument, "url"));
             return webGet(url, "");
         });
 
-        append_response("GET", "/getlocal", "text/plain;charset=utf-8", [](RESPONSE_CALLBACK_ARGS) -> std::string
+        webServer.append_response("GET", "/getlocal", "text/plain;charset=utf-8", [](RESPONSE_CALLBACK_ARGS) -> std::string
         {
-            return fileGet(UrlDecode(getUrlArg(argument, "path")));
+            return fileGet(urlDecode(getUrlArg(request.argument, "path")));
         });
     }
 
-    std::string env_port = GetEnv("PORT");
+    //webServer.append_response("POST", "/create-profile", "text/plain;charset=utf-8", createProfile);
+
+    //webServer.append_response("GET", "/list-profiles", "text/plain;charset=utf-8", listProfiles);
+
+    std::string env_port = getEnv("PORT");
     if(env_port.size())
-        listen_port = to_int(env_port, listen_port);
-    listener_args args = {listen_address, listen_port, max_pending_connections, max_concurrent_threads};
+        global.listenPort = to_int(env_port, global.listenPort);
+    listener_args args = {global.listenAddress, global.listenPort, global.maxPendingConns, global.maxConcurThreads, cron_tick_caller, 200};
     //std::cout<<"Serving HTTP @ http://"<<listen_address<<":"<<listen_port<<std::endl;
-    writeLog(0, "Startup completed. Serving HTTP @ http://" + listen_address + ":" + std::to_string(listen_port), LOG_LEVEL_INFO);
-    start_web_server_multi(&args);
+    writeLog(0, "Startup completed. Serving HTTP @ http://" + global.listenAddress + ":" + std::to_string(global.listenPort), LOG_LEVEL_INFO);
+    webServer.start_web_server_multi(&args);
 
 #ifdef _WIN32
     WSACleanup();
